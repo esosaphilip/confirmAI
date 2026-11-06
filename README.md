@@ -8,6 +8,16 @@
 
 ---
 
+## Demo
+
+A full run — attach the AB and the invoice, run the check, and read the result:
+
+![confirmAI demo: uploading an AB and invoice, running the tolerance check, and viewing the NEGATIVE result](./.screenshots/demo.gif)
+
+<sub>▶ GIF runs at 2× speed. [Download the full-quality MP4](./.screenshots/demo.mp4)</sub>
+
+---
+
 ## The problem
 
 In B2B procurement, a buyer agrees a price in an **order confirmation** and later
@@ -116,14 +126,40 @@ built with Vite. Implements the four screens of the product design: **Verify**, 
 
 ## Screens
 
-The UI follows a supplied product design (`confirmAI.pdf`, included in the repo).
+The UI follows a supplied product design (`confirmAI.pdf`, included in the repo), implemented as four screens.
 
-| Screen | Purpose |
-|---|---|
-| **New verification** | Drag & drop the AB and invoice PDFs, see validation badges, set tolerance, run. |
-| **Matching rules** | Edit `price_tolerance_eur` with quick presets (Exact / €1 / €5 / €25) and a live impact preview. |
-| **Running** | Live step-by-step progress (`STEP 2 OF 3`) with the active tolerance shown. |
-| **Result** | POSITIVE/NEGATIVE banner, financial summary, discrepancies, and a dark monospace tolerance log. |
+### 1 · New verification
+
+Upload the supplier's AB and the matching invoice. Validation badges confirm each file is a PDF under the 20 MB limit; the tolerance shown here is pulled from the saved rules.
+
+<table>
+<tr>
+<td width="50%"><img src="./.screenshots/01-verify-empty.png" alt="New verification, empty state"></td>
+<td width="50%"><img src="./.screenshots/02-verify-ready.png" alt="New verification, both documents attached"></td>
+</tr>
+<tr>
+<td align="center"><sub>Empty state</sub></td>
+<td align="center"><sub>AB + invoice attached, ready to run</sub></td>
+</tr>
+</table>
+
+### 2 · Matching rules
+
+Edit `price_tolerance_eur` with quick presets (Exact / €1 / €5 / €25) and see a live **impact preview** showing how the rule changes the verdict.
+
+![Matching rules screen](./.screenshots/05-rules.png)
+
+### 3 · Running
+
+Live, step-by-step progress (`STEP 2 OF 3`) instead of an opaque spinner, with the active tolerance shown.
+
+![Running screen](./.screenshots/03-running.png)
+
+### 4 · Result
+
+A POSITIVE/NEGATIVE verdict, the financial summary, the discrepancies found, and a dark monospace **tolerance log** that shows exactly how the decision was reached.
+
+![Result screen](./.screenshots/04-result.png)
 
 > History and per-line-item breakdown are stubbed for a later phase.
 
@@ -240,6 +276,7 @@ confirmAI/
 ├── indexing.py         # PDF → chunks → Chroma vector store
 ├── vergleicher.py      # Extraction (LLM) + deterministic tolerance comparison
 ├── confirmAI.pdf       # UI/product design reference
+├── .screenshots/       # Screenshots + demo GIF/MP4 used in this README
 ├── frontend/           # React + Vite + TypeScript app
 │   └── src/
 │       ├── pages/      # Verify, Rules, Running, History screens
