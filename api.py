@@ -1,6 +1,8 @@
+import asyncio
 import os
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -10,7 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from indexing import index_single_document
-from vergleicher import verify_invoice_vs_ab
+from logging_config import configure_logging, get_logger, run_id_var
+from vergleicher import EMBED_MODEL, LLM_MODEL, averify_invoice_vs_ab
+
+configure_logging()
+logger = get_logger("api")
 
 RUNS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "runs")
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -26,7 +32,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv("CONFIRMAI_CORS_ORIGINS", "http://localhost:5173").split(",")
+        if origin.strip()
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -65,6 +75,7 @@ class VerificationResult(BaseModel):
     difference: float
     tolerance: float
     discrepancies: List[str]
+    needs_review: bool = False  # True, wenn ein Betrag nicht extrahiert werden konnte
     ab_number: Optional[str] = None
     invoice_number: Optional[str] = None
     ab_filename: Optional[str] = None
@@ -160,7 +171,7 @@ async def _save_upload(upload: UploadFile, dest_dir: str, dest_name: str) -> str
     return dest
 
 
-def _run_job(
+async def _run_job(
     run_id: str,
     ab_path: str,
     invoice_path: str,
@@ -170,24 +181,35 @@ def _run_job(
     invoice_dir: str,
     tolerance: float,
 ) -> None:
-    """Laeuft im Hintergrund-Thread und aktualisiert den Job-Zustand schrittweise."""
+    """Laeuft als Hintergrund-Task im Event-Loop und aktualisiert den Job-Zustand.
+
+    Blockierende Arbeit (PDF-Parsing, Embeddings, Chroma) laeuft per
+    ``asyncio.to_thread`` in Worker-Threads, der LLM-Aufruf ist asynchron.
+    Der Server bleibt dadurch fuer Polling und neue Uploads ansprechbar.
+    """
+    run_id_var.set(run_id)
     job = JOBS[run_id]
     run_dir = os.path.dirname(ab_path)
+    started = time.perf_counter()
+    logger.info(
+        "Verification started",
+        extra={"fields": {"ab_file": ab_name, "invoice_file": invoice_name, "tolerance": tolerance}},
+    )
     try:
         _log(job, "config", f"price_tolerance_eur = {tolerance:.2f}")
 
         _set_step(job, "index_ab", "running")
-        index_single_document(ab_path, persist_directory=ab_dir)
+        await asyncio.to_thread(index_single_document, ab_path, ab_dir)
         _set_step(job, "index_ab", "done")
         _log(job, "index", f"AB indexed from {ab_name}")
 
         _set_step(job, "index_invoice", "running")
-        index_single_document(invoice_path, persist_directory=invoice_dir)
+        await asyncio.to_thread(index_single_document, invoice_path, invoice_dir)
         _set_step(job, "index_invoice", "done")
         _log(job, "index", f"invoice indexed from {invoice_name}")
 
         _set_step(job, "evaluate", "running")
-        result = verify_invoice_vs_ab(
+        result = await averify_invoice_vs_ab(
             price_tolerance_eur=tolerance,
             ab_persist_dir=ab_dir,
             invoice_persist_dir=invoice_dir,
@@ -202,6 +224,7 @@ def _run_job(
             "difference": result["difference"],
             "tolerance": tolerance,
             "discrepancies": result["discrepancies"],
+            "needs_review": result.get("needs_review", False),
             "ab_number": _doc_number(ab_name, "ab"),
             "invoice_number": _doc_number(invoice_name, "invoice"),
             "ab_filename": ab_name,
@@ -209,7 +232,16 @@ def _run_job(
             "checked_at": datetime.now().strftime("%d.%m.%Y · %H:%M"),
         }
         job["state"] = "completed"
+        logger.info(
+            "Verification completed",
+            extra={"fields": {
+                "status": result["status"],
+                "difference": result["difference"],
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+            }},
+        )
     except Exception as exc:  # noqa: BLE001 - Fehler sollen im Job sichtbar werden
+        logger.exception("Verification failed")
         job["state"] = "error"
         job["error"] = str(exc)
         for step in job["steps"]:
@@ -225,7 +257,7 @@ def _run_job(
 # --------------------------------------------------------------------------- #
 @app.get("/api/v1/health")
 def health() -> Dict[str, str]:
-    return {"status": "ok", "model": "mistral:latest", "embeddings": "nomic-embed-text"}
+    return {"status": "ok", "model": LLM_MODEL, "embeddings": EMBED_MODEL}
 
 
 @app.get("/api/v1/rules", response_model=RuleConfig)
@@ -236,6 +268,7 @@ def get_rules() -> RuleConfig:
 @app.put("/api/v1/rules", response_model=RuleConfig)
 def update_rules(payload: RuleConfig) -> RuleConfig:
     RULES["price_tolerance_eur"] = payload.price_tolerance_eur
+    logger.info("Rules updated", extra={"fields": {"price_tolerance_eur": payload.price_tolerance_eur}})
     return RuleConfig(**RULES)
 
 
@@ -250,9 +283,12 @@ async def create_verification(
         if not upload.filename or not upload.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"{upload.filename or 'file'} must be a PDF.")
 
+    if price_tolerance_eur is not None and price_tolerance_eur < 0:
+        raise HTTPException(status_code=422, detail="price_tolerance_eur must be >= 0.")
     tolerance = RULES["price_tolerance_eur"] if price_tolerance_eur is None else price_tolerance_eur
 
     run_id = uuid.uuid4().hex[:12]
+    run_id_var.set(run_id)
     run_dir = os.path.join(RUNS_ROOT, run_id)
     ab_name = ab_file.filename or "ab.pdf"
     invoice_name = invoice_file.filename or "invoice.pdf"
@@ -278,6 +314,7 @@ async def create_verification(
         os.path.join(run_dir, "invoice_db"),
         tolerance,
     )
+    logger.info("Verification accepted", extra={"fields": {"ab_file": ab_name, "invoice_file": invoice_name}})
     return JobSnapshot(**JOBS[run_id])
 
 

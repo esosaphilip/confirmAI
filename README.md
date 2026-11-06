@@ -4,7 +4,9 @@
 > original **order confirmation (Auftragsbestätigung, "AB")** and flags price
 > deviations outside a configurable tolerance — with a full audit trail.
 
-**Stack:** Python · FastAPI · LangChain · Ollama (Mistral + Nomic embeddings) · ChromaDB · React 18 · TypeScript · Vite
+**Stack:** Python · FastAPI · LangChain · Ollama (Mistral + Nomic embeddings) · ChromaDB · Pydantic · pytest · React 18 · TypeScript · Vite
+
+[![CI](https://github.com/esosaphilip/confirmAI/actions/workflows/ci.yml/badge.svg)](https://github.com/esosaphilip/confirmAI/actions/workflows/ci.yml)
 
 ---
 
@@ -47,10 +49,16 @@ This "**AI extracts, code decides**" split is the core architectural idea:
 - The LLM is only ever asked for a **single number** (the document net total), never a judgement.
 - Retrieval is scoped with **separate vector stores per document type** so the model never
   confuses the AB total with the invoice total.
-- The model output is parsed defensively (`_parse_amount`) to tolerate German `1.234,56`
-  and English `1,234.56` number formats and stray punctuation.
-- The final comparison is a one-line, provable arithmetic check — visible in the
-  **tolerance log** the UI shows the user.
+- The model answers in **JSON mode** and its output is validated against a **Pydantic schema**
+  (`ExtractedTotal`). If the JSON is broken, a regex fallback (`parse_amount`) reads the
+  amount and handles German `1.234,56` and English `1,234.56` formats. Each extracted value
+  is also checked against the source text and logged if it doesn't appear there verbatim.
+- **Fail-safe by design:** if a total can't be extracted, the result is never `POSITIVE`.
+  The run returns `NEGATIVE` with `needs_review: true` and a "manual review" discrepancy.
+- The final comparison lives in its own module ([tolerance.py](tolerance.py)): `Decimal`
+  arithmetic at cent precision (no float rounding surprises at the boundary), an inclusive
+  limit, and no AI imports. It is covered by unit tests and visible in the **tolerance log**
+  the UI shows the user.
 
 Every run produces a timestamped log, so a result can be reconstructed after the fact.
 
@@ -114,9 +122,15 @@ run the pipeline as a **background task**, and expose a **pollable job snapshot*
 is enabled for the Vite dev server. Uploads are capped at 20 MB and validated as PDFs;
 each run gets an isolated working directory that is cleaned up on completion.
 
-**Pipeline** ([indexing.py](indexing.py), [vergleicher.py](vergleicher.py)) — PyPDFLoader →
-recursive character splitting → Chroma vector store (one store per document) → similarity
-search scoped to *totals* → Mistral extracts the net total → deterministic tolerance check.
+**Pipeline** ([indexing.py](indexing.py), [vergleicher.py](vergleicher.py),
+[extraction.py](extraction.py), [tolerance.py](tolerance.py)) — PyPDFLoader → recursive
+character splitting → Chroma vector store (one store per document) → similarity search scoped
+to *totals* → Mistral extracts the net total as validated JSON → deterministic tolerance check.
+
+**Non-blocking by design.** The job runs as an `async` background task. Blocking work (PDF
+parsing, embeddings, Chroma) is offloaded with `asyncio.to_thread`, and the LLM is called
+through `ainvoke`. The AB and invoice extractions run **concurrently** with
+`asyncio.gather`, so the server keeps answering status polls and new uploads while a check runs.
 
 **Frontend** ([frontend/](frontend)) — React 18 + React Router + TypeScript (strict mode),
 built with Vite. Implements the four screens of the product design: **Verify**, **Rules**,
@@ -183,14 +197,27 @@ ollama pull nomic-embed-text:latest
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install fastapi "uvicorn[standard]" python-multipart \
-            langchain-ollama langchain-community langchain-text-splitters \
-            chromadb pypdf
+pip install -r requirements-dev.txt   # or requirements.txt for runtime only
 
 uvicorn api:app --reload --port 8000
 ```
 
 The API is now at `http://127.0.0.1:8000` (interactive docs at `/docs`).
+
+Configuration is through environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONFIRMAI_LLM_MODEL` | `mistral:latest` | Ollama chat model used for extraction |
+| `CONFIRMAI_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server |
+| `CONFIRMAI_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed origins |
+| `CONFIRMAI_LOG_FORMAT` | `json` | `json` for log shipping, `text` for local reading |
+| `CONFIRMAI_LOG_LEVEL` | `INFO` | Log level |
+
+Sample documents for a manual test are in [`sample_docs/`](sample_docs): one AB and two
+invoices. `RE-2026-10871.pdf` should return **NEGATIVE** (+€130.00) and
+`RE-2026-10872.pdf` should return **POSITIVE** (+€2.40) at the default €5.00 tolerance.
 
 ### 2. Frontend
 
@@ -202,6 +229,45 @@ npm run dev
 
 Open `http://localhost:5173`. The Vite dev server proxies `/api/*` to the backend, so no
 environment configuration is needed.
+
+---
+
+## Testing
+
+```bash
+pytest                 # unit + API tests, no Ollama needed (runs in CI)
+pytest -m integration  # end-to-end on sample_docs/ against a running Ollama
+ruff check .
+```
+
+The default suite fakes the vector store and the LLM, so it runs in under a second and
+covers what matters for a financial check:
+
+- **Tolerance rule** — within/outside tolerance, the exact boundary, one cent over,
+  invoices *below* the AB, zero tolerance, negative tolerance rejected.
+- **Fail-safe** — a missing or `null` total from the LLM never auto-approves.
+- **Extraction** — Pydantic schema path, broken-JSON regex fallback, German/English number formats.
+- **API** — full upload → background job → poll lifecycle, non-PDF / empty / negative-tolerance
+  rejection, pipeline errors reported in the job snapshot.
+
+GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs lint, tests and the
+frontend type-check and build on every push and pull request.
+
+---
+
+## Observability
+
+Every log line is a JSON object tagged with the run's `run_id`, so one verification can be
+traced from upload to verdict:
+
+```json
+{"ts": "2026-11-06T22:23:06.362+00:00", "level": "INFO", "logger": "confirmai.extraction", "run_id": "3f9c1a2b7d4e", "msg": "Extracted net total", "doc": "invoice", "method": "schema", "value": 12480.0, "grounded": true}
+{"ts": "2026-11-06T22:23:06.363+00:00", "level": "INFO", "logger": "confirmai.vergleicher", "run_id": "3f9c1a2b7d4e", "msg": "Tolerance evaluated", "status": "NEGATIVE", "ab_total_net": "12350.00", "invoice_total_net": "12480.00", "difference": "130.00", "tolerance": "5.00", "within_tolerance": false}
+```
+
+Logged per run: accepted files, indexing stats (pages, chunks, duration), each extracted value
+with its extraction method and grounding check, the tolerance decision, and total duration.
+Failures are logged with a stack trace. Set `CONFIRMAI_LOG_FORMAT=text` for readable local output.
 
 ---
 
@@ -272,9 +338,15 @@ The invoice is €130.00 above the AB, exceeding the €5.00 tolerance → **NEG
 
 ```
 confirmAI/
-├── api.py              # FastAPI app: upload endpoints, background jobs, job state
+├── api.py              # FastAPI app: upload endpoints, async background jobs, job state
 ├── indexing.py         # PDF → chunks → Chroma vector store
-├── vergleicher.py      # Extraction (LLM) + deterministic tolerance comparison
+├── vergleicher.py      # Orchestration: concurrent retrieval + extraction, then evaluation
+├── extraction.py       # Pydantic schema for the LLM answer, JSON + regex fallback parsing
+├── tolerance.py        # Deterministic Decimal-based tolerance rule (no AI)
+├── logging_config.py   # JSON structured logging with per-run run_id
+├── tests/              # pytest suite (unit, API, optional Ollama integration)
+├── sample_docs/        # Test AB + two invoices (one NEGATIVE, one POSITIVE)
+├── .github/workflows/  # CI: ruff + pytest + frontend build
 ├── confirmAI.pdf       # UI/product design reference
 ├── .screenshots/       # Screenshots + demo GIF/MP4 used in this README
 ├── frontend/           # React + Vite + TypeScript app
@@ -303,6 +375,11 @@ This is a working prototype, and it's honest about its edges:
 
 ### Roadmap
 
+- [x] Pydantic-validated LLM output with fail-safe fallback
+- [x] Unit + API test suite and CI
+- [x] Structured JSON logging with per-run correlation IDs
+- [x] Non-blocking async pipeline
+- [ ] Three-way matching: AB ↔ delivery note (Lieferschein) ↔ invoice, checking quantity and delivery date
 - [ ] Per-line-item price comparison with the discrepancy table
 - [ ] Persistent run history and report export
 - [ ] Pluggable extractor interface (Ollama / OpenAI / Anthropic)
